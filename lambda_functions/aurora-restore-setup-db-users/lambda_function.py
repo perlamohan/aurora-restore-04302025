@@ -4,14 +4,17 @@ Lambda function to set up database users after a cluster restore.
 """
 
 import json
-import time
+import logging
 from typing import Dict, Any, Optional, Tuple, List
 
 from utils.base_handler import BaseHandler
-from utils.common import logger
-from utils.validation import validate_required_params, validate_region, validate_cluster_id
-from utils.aws_utils import get_client, handle_aws_error, get_secret
-from utils.state_utils import trigger_next_step
+from utils.aws_utils import get_rds_client, get_secret
+from utils.config_utils import ConfigManager, ConfigValidator
+from utils.state_utils import StateManager, RestoreState
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SetupDbUsersHandler(BaseHandler):
     """Handler for setting up database users."""
@@ -19,8 +22,9 @@ class SetupDbUsersHandler(BaseHandler):
     def __init__(self):
         """Initialize the setup DB users handler."""
         super().__init__('setup_db_users')
+        self.config_manager = ConfigManager()
+        self.state_manager = StateManager(self.config_manager.get_all().region)
         self.rds_client = None
-        self.secrets_client = None
     
     def validate_config(self) -> None:
         """
@@ -29,21 +33,12 @@ class SetupDbUsersHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing or invalid
         """
-        required_params = {
-            'target_region': self.config.get('target_region'),
-            'target_cluster_id': self.config.get('target_cluster_id'),
-            'master_credentials_secret_id': self.config.get('master_credentials_secret_id')
-        }
+        config = self.config_manager.get_all()
         
-        missing_params = validate_required_params(required_params)
-        if missing_params:
-            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
-        
-        if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {self.config['target_region']}")
-        
-        if not validate_cluster_id(self.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
+        # Validate configuration using the ConfigValidator
+        errors = ConfigValidator.validate_function_config(config.__dict__, 'aurora-restore-setup-db-users')
+        if errors:
+            raise ValueError(f"Configuration validation errors: {', '.join(errors)}")
     
     def initialize_clients(self) -> None:
         """
@@ -52,11 +47,11 @@ class SetupDbUsersHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not self.config.get('target_region'):
+        config = self.config_manager.get_all()
+        if not config.target_region:
             raise ValueError("Target region is required")
         
-        self.rds_client = get_client('rds', self.config['target_region'])
-        self.secrets_client = get_client('secretsmanager', self.config['target_region'])
+        self.rds_client = get_rds_client(config.target_region)
     
     def get_cluster_endpoint(self, cluster_id: str) -> Tuple[str, int]:
         """
@@ -85,7 +80,7 @@ class SetupDbUsersHandler(BaseHandler):
             
             return endpoint, port
         except Exception as e:
-            handle_aws_error(e, f"Error getting endpoint for cluster {cluster_id}")
+            logger.error(f"Error getting endpoint for cluster {cluster_id}: {str(e)}")
             raise
     
     def get_master_credentials(self) -> Tuple[str, str]:
@@ -99,8 +94,9 @@ class SetupDbUsersHandler(BaseHandler):
             Exception: If credentials retrieval fails
         """
         try:
-            secret_id = self.config['master_credentials_secret_id']
-            secret = get_secret(self.secrets_client, secret_id)
+            config = self.config_manager.get_all()
+            secret_id = config.master_credentials_secret_id
+            secret = get_secret(secret_id)
             
             if not secret:
                 raise ValueError(f"Secret {secret_id} not found")
@@ -113,7 +109,7 @@ class SetupDbUsersHandler(BaseHandler):
             
             return username, password
         except Exception as e:
-            handle_aws_error(e, "Error getting master credentials")
+            logger.error(f"Error getting master credentials: {str(e)}")
             raise
     
     def setup_users(self, endpoint: str, port: int, master_username: str, master_password: str) -> List[Dict[str, str]]:
@@ -149,7 +145,8 @@ class SetupDbUsersHandler(BaseHandler):
             cur = conn.cursor()
             
             # Get list of users to create from config
-            users = self.config.get('db_users', [])
+            config = self.config_manager.get_all()
+            users = config.get('db_users', [])
             created_users = []
             
             for user in users:
@@ -200,6 +197,9 @@ class SetupDbUsersHandler(BaseHandler):
             # Get operation ID
             operation_id = self.get_operation_id(event)
             
+            # Load configuration
+            self.config_manager.load_config(event)
+            
             # Validate configuration
             self.validate_config()
             
@@ -207,7 +207,7 @@ class SetupDbUsersHandler(BaseHandler):
             self.initialize_clients()
             
             # Get cluster details
-            cluster_id = self.config['target_cluster_id']
+            cluster_id = self.config_manager.get_all().target_cluster_id
             
             # Get cluster endpoint
             endpoint, port = self.get_cluster_endpoint(cluster_id)
@@ -221,38 +221,45 @@ class SetupDbUsersHandler(BaseHandler):
             # Save state
             state_data = {
                 'target_cluster_id': cluster_id,
-                'cluster_endpoint': endpoint,
-                'cluster_port': port,
+                'endpoint': endpoint,
+                'port': port,
                 'users_created': created_users,
-                'status': 'completed',
+                'status': 'success',
                 'success': True
             }
             
-            self.save_state(state_data)
+            # Save state using StateManager
+            self.state_manager.save_state(operation_id, 'setup_db_users', state_data)
             
-            # Log audit
-            self.log_audit(operation_id, 'SUCCESS', {
-                'target_cluster_id': cluster_id,
-                'users_created': len(created_users)
-            })
+            # Log audit event
+            self.state_manager.log_audit_event(
+                operation_id,
+                'setup_db_users',
+                'SUCCESS',
+                {
+                    'target_cluster_id': cluster_id,
+                    'users_created': len(created_users)
+                }
+            )
             
             # Update metrics
-            self.update_metrics(operation_id, 'users_created', len(created_users))
+            self.state_manager.update_metrics(operation_id, 'setup_db_users', 'users_created', len(created_users))
             
-            # Trigger next step
-            trigger_next_step(operation_id, 'verify_restore', state_data)
+            # Update state and trigger next step
+            self.state_manager.update_state(operation_id, RestoreState.NOTIFY_COMPLETION, state_data)
             
             return self.create_response(operation_id, {
                 'message': f"Successfully set up {len(created_users)} users for cluster {cluster_id}",
                 'target_cluster_id': cluster_id,
-                'cluster_endpoint': endpoint,
-                'cluster_port': port,
+                'endpoint': endpoint,
+                'port': port,
                 'users_created': created_users,
-                'next_step': 'verify_restore'
+                'next_step': 'notify_completion'
             })
+            
         except Exception as e:
             return self.handle_error(operation_id, e, {
-                'target_cluster_id': self.config.get('target_cluster_id')
+                'target_cluster_id': self.config_manager.get_all().target_cluster_id if hasattr(self, 'config_manager') else None
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

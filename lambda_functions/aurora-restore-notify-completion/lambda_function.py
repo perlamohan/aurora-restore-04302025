@@ -4,14 +4,18 @@ Lambda function to send notifications about the completion of the restore proces
 """
 
 import json
+import logging
 import time
 from typing import Dict, Any, Optional, List
 
 from utils.base_handler import BaseHandler
-from utils.common import logger
-from utils.validation import validate_required_params, validate_region, validate_cluster_id
-from utils.aws_utils import get_client, handle_aws_error
-from utils.state_utils import get_state, update_state
+from utils.aws_utils import get_sns_client, get_sqs_client, publish_sns_message
+from utils.config_utils import ConfigManager, ConfigValidator
+from utils.state_utils import StateManager, RestoreState
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class NotifyCompletionHandler(BaseHandler):
     """Handler for sending completion notifications."""
@@ -19,6 +23,8 @@ class NotifyCompletionHandler(BaseHandler):
     def __init__(self):
         """Initialize the notify completion handler."""
         super().__init__('notify_completion')
+        self.config_manager = ConfigManager()
+        self.state_manager = StateManager(self.config_manager.get_all().region)
         self.sns_client = None
         self.sqs_client = None
     
@@ -29,22 +35,12 @@ class NotifyCompletionHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing or invalid
         """
-        required_params = {
-            'target_region': self.config.get('target_region'),
-            'target_cluster_id': self.config.get('target_cluster_id'),
-            'notification_topic_arn': self.config.get('notification_topic_arn'),
-            'notification_queue_url': self.config.get('notification_queue_url')
-        }
+        config = self.config_manager.get_all()
         
-        missing_params = validate_required_params(required_params)
-        if missing_params:
-            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
-        
-        if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {self.config['target_region']}")
-        
-        if not validate_cluster_id(self.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
+        # Validate configuration using the ConfigValidator
+        errors = ConfigValidator.validate_function_config(config.__dict__, 'aurora-restore-notify-completion')
+        if errors:
+            raise ValueError(f"Configuration validation errors: {', '.join(errors)}")
     
     def initialize_clients(self) -> None:
         """
@@ -53,11 +49,12 @@ class NotifyCompletionHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not self.config.get('target_region'):
+        config = self.config_manager.get_all()
+        if not config.target_region:
             raise ValueError("Target region is required")
         
-        self.sns_client = get_client('sns', self.config['target_region'])
-        self.sqs_client = get_client('sqs', self.config['target_region'])
+        self.sns_client = get_sns_client(config.target_region)
+        self.sqs_client = get_sqs_client(config.target_region)
     
     def get_operation_summary(self, operation_id: str) -> Dict[str, Any]:
         """
@@ -74,7 +71,7 @@ class NotifyCompletionHandler(BaseHandler):
         """
         try:
             # Get state data
-            state_data = get_state(operation_id)
+            state_data = self.state_manager.get_state(operation_id)
             
             if not state_data:
                 raise ValueError(f"State data not found for operation {operation_id}")
@@ -94,8 +91,8 @@ class NotifyCompletionHandler(BaseHandler):
             # Add verification information if available
             if 'verification_status' in state_data:
                 summary['verification_status'] = state_data['verification_status']
-                summary['schema_count'] = len(state_data.get('schema_info', {}).get('schemas', []))
-                summary['table_count'] = len(state_data.get('schema_info', {}).get('tables', []))
+                summary['schema_count'] = len(state_data.get('schema_details', {}).get('schemas', []))
+                summary['table_count'] = len(state_data.get('schema_details', {}).get('tables', []))
             
             return summary
         except Exception as e:
@@ -117,7 +114,8 @@ class NotifyCompletionHandler(BaseHandler):
             Exception: If notification fails
         """
         try:
-            topic_arn = self.config['notification_topic_arn']
+            config = self.config_manager.get_all()
+            topic_arn = config.sns_topic_arn
             
             # Prepare message
             message = {
@@ -128,18 +126,17 @@ class NotifyCompletionHandler(BaseHandler):
             }
             
             # Send message
-            response = self.sns_client.publish(
-                TopicArn=topic_arn,
-                Message=json.dumps(message),
-                Subject=f"Aurora Restore Completion - {summary['target_cluster_id']}"
+            message_id = publish_sns_message(
+                topic_arn=topic_arn,
+                message=json.dumps(message),
+                subject=f"Aurora Restore Completion - {summary['target_cluster_id']}"
             )
             
-            message_id = response['MessageId']
             logger.info(f"Sent SNS notification with ID {message_id}")
             
             return message_id
         except Exception as e:
-            handle_aws_error(e, "Error sending SNS notification")
+            logger.error(f"Error sending SNS notification: {str(e)}")
             raise
     
     def send_sqs_message(self, operation_id: str, summary: Dict[str, Any]) -> str:
@@ -157,7 +154,8 @@ class NotifyCompletionHandler(BaseHandler):
             Exception: If message sending fails
         """
         try:
-            queue_url = self.config['notification_queue_url']
+            config = self.config_manager.get_all()
+            queue_url = config.notification_queue_url
             
             # Prepare message
             message = {
@@ -178,7 +176,7 @@ class NotifyCompletionHandler(BaseHandler):
             
             return message_id
         except Exception as e:
-            handle_aws_error(e, "Error sending SQS message")
+            logger.error(f"Error sending SQS message: {str(e)}")
             raise
     
     def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -196,6 +194,9 @@ class NotifyCompletionHandler(BaseHandler):
             # Get operation ID
             operation_id = self.get_operation_id(event)
             
+            # Load configuration
+            self.config_manager.load_config(event)
+            
             # Validate configuration
             self.validate_config()
             
@@ -209,26 +210,35 @@ class NotifyCompletionHandler(BaseHandler):
             sns_message_id = self.send_sns_notification(operation_id, summary)
             sqs_message_id = self.send_sqs_message(operation_id, summary)
             
-            # Update state with notification information
-            notification_data = {
+            # Save state
+            state_data = {
                 'notification_sent': True,
                 'notification_time': int(time.time()),
                 'sns_message_id': sns_message_id,
                 'sqs_message_id': sqs_message_id
             }
             
-            update_state(operation_id, notification_data)
+            # Save state using StateManager
+            self.state_manager.save_state(operation_id, 'notify_completion', state_data)
             
-            # Log audit
-            self.log_audit(operation_id, 'SUCCESS', {
-                'target_cluster_id': summary['target_cluster_id'],
-                'status': summary['status'],
-                'sns_message_id': sns_message_id,
-                'sqs_message_id': sqs_message_id
-            })
+            # Log audit event
+            self.state_manager.log_audit_event(
+                operation_id,
+                'notify_completion',
+                'SUCCESS',
+                {
+                    'target_cluster_id': summary['target_cluster_id'],
+                    'status': summary['status'],
+                    'sns_message_id': sns_message_id,
+                    'sqs_message_id': sqs_message_id
+                }
+            )
             
             # Update metrics
-            self.update_metrics(operation_id, 'notification_sent', 1)
+            self.state_manager.update_metrics(operation_id, 'notify_completion', 'notification_sent', 1)
+            
+            # Update state and trigger next step
+            self.state_manager.update_state(operation_id, RestoreState.COMPLETED, state_data)
             
             return self.create_response(operation_id, {
                 'message': f"Successfully sent completion notifications for cluster {summary['target_cluster_id']}",
@@ -238,9 +248,10 @@ class NotifyCompletionHandler(BaseHandler):
                 'sqs_message_id': sqs_message_id,
                 'next_step': None
             })
+            
         except Exception as e:
             return self.handle_error(operation_id, e, {
-                'target_cluster_id': self.config.get('target_cluster_id')
+                'target_cluster_id': self.config_manager.get_all().target_cluster_id if hasattr(self, 'config_manager') else None
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

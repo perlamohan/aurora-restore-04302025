@@ -1,0 +1,9 @@
+{
+    "operation_id": "test-op-001",
+    "source_region": "us-east-1",
+    "source_cluster_id": "your-source-cluster-id",
+    "snapshot_prefix": "daily-snapshot",
+    "environment": "dev",
+    "log_level": "INFO",
+    "target_date": "2024-04-29"
+} 

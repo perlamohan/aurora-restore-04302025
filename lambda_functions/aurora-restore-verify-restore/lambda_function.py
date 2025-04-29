@@ -4,14 +4,17 @@ Lambda function to verify the restored cluster's functionality.
 """
 
 import json
-import time
+import logging
 from typing import Dict, Any, Optional, Tuple, List
 
 from utils.base_handler import BaseHandler
-from utils.common import logger
-from utils.validation import validate_required_params, validate_region, validate_cluster_id
-from utils.aws_utils import get_client, handle_aws_error, get_secret
-from utils.state_utils import trigger_next_step
+from utils.aws_utils import get_rds_client, get_secret
+from utils.config_utils import ConfigManager, ConfigValidator
+from utils.state_utils import StateManager, RestoreState
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class VerifyRestoreHandler(BaseHandler):
     """Handler for verifying cluster restore."""
@@ -19,8 +22,9 @@ class VerifyRestoreHandler(BaseHandler):
     def __init__(self):
         """Initialize the verify restore handler."""
         super().__init__('verify_restore')
+        self.config_manager = ConfigManager()
+        self.state_manager = StateManager(self.config_manager.get_all().region)
         self.rds_client = None
-        self.secrets_client = None
     
     def validate_config(self) -> None:
         """
@@ -29,21 +33,12 @@ class VerifyRestoreHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing or invalid
         """
-        required_params = {
-            'target_region': self.config.get('target_region'),
-            'target_cluster_id': self.config.get('target_cluster_id'),
-            'master_credentials_secret_id': self.config.get('master_credentials_secret_id')
-        }
+        config = self.config_manager.get_all()
         
-        missing_params = validate_required_params(required_params)
-        if missing_params:
-            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
-        
-        if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {self.config['target_region']}")
-        
-        if not validate_cluster_id(self.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
+        # Validate configuration using the ConfigValidator
+        errors = ConfigValidator.validate_function_config(config.__dict__, 'aurora-restore-verify-restore')
+        if errors:
+            raise ValueError(f"Configuration validation errors: {', '.join(errors)}")
     
     def initialize_clients(self) -> None:
         """
@@ -52,11 +47,11 @@ class VerifyRestoreHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing
         """
-        if not self.config.get('target_region'):
+        config = self.config_manager.get_all()
+        if not config.target_region:
             raise ValueError("Target region is required")
         
-        self.rds_client = get_client('rds', self.config['target_region'])
-        self.secrets_client = get_client('secretsmanager', self.config['target_region'])
+        self.rds_client = get_rds_client(config.target_region)
     
     def get_cluster_endpoint(self, cluster_id: str) -> Tuple[str, int]:
         """
@@ -85,7 +80,7 @@ class VerifyRestoreHandler(BaseHandler):
             
             return endpoint, port
         except Exception as e:
-            handle_aws_error(e, f"Error getting endpoint for cluster {cluster_id}")
+            logger.error(f"Error getting endpoint for cluster {cluster_id}: {str(e)}")
             raise
     
     def get_master_credentials(self) -> Tuple[str, str]:
@@ -99,8 +94,9 @@ class VerifyRestoreHandler(BaseHandler):
             Exception: If credentials retrieval fails
         """
         try:
-            secret_id = self.config['master_credentials_secret_id']
-            secret = get_secret(self.secrets_client, secret_id)
+            config = self.config_manager.get_all()
+            secret_id = config.master_credentials_secret_id
+            secret = get_secret(secret_id)
             
             if not secret:
                 raise ValueError(f"Secret {secret_id} not found")
@@ -113,7 +109,7 @@ class VerifyRestoreHandler(BaseHandler):
             
             return username, password
         except Exception as e:
-            handle_aws_error(e, "Error getting master credentials")
+            logger.error(f"Error getting master credentials: {str(e)}")
             raise
     
     def verify_connection(self, endpoint: str, port: int, username: str, password: str) -> bool:
@@ -237,6 +233,9 @@ class VerifyRestoreHandler(BaseHandler):
             # Get operation ID
             operation_id = self.get_operation_id(event)
             
+            # Load configuration
+            self.config_manager.load_config(event)
+            
             # Validate configuration
             self.validate_config()
             
@@ -244,91 +243,103 @@ class VerifyRestoreHandler(BaseHandler):
             self.initialize_clients()
             
             # Get cluster details
-            cluster_id = self.config['target_cluster_id']
+            cluster_id = self.config_manager.get_all().target_cluster_id
             
             # Get cluster endpoint
             endpoint, port = self.get_cluster_endpoint(cluster_id)
             
             # Get master credentials
-            master_username, master_password = self.get_master_credentials()
+            username, password = self.get_master_credentials()
             
             # Verify connection
-            connection_verified = self.verify_connection(endpoint, port, master_username, master_password)
+            connection_success = self.verify_connection(endpoint, port, username, password)
             
-            if not connection_verified:
-                error_message = f"Failed to verify connection to cluster {cluster_id}"
+            if not connection_success:
+                error_message = f"Failed to connect to cluster {cluster_id}"
                 logger.error(error_message)
                 
                 # Save state with error
                 state_data = {
                     'target_cluster_id': cluster_id,
-                    'cluster_endpoint': endpoint,
-                    'cluster_port': port,
+                    'endpoint': endpoint,
+                    'port': port,
+                    'connection_success': False,
                     'verification_status': 'failed',
                     'status': 'failed',
                     'success': False,
                     'error': error_message
                 }
                 
-                self.save_state(state_data)
+                # Save state using StateManager
+                self.state_manager.save_state(operation_id, 'verify_restore', state_data)
                 
-                # Log audit with failure
-                self.log_audit(operation_id, 'FAILED', {
-                    'target_cluster_id': cluster_id,
-                    'error': error_message
-                })
+                # Log audit event
+                self.state_manager.log_audit_event(
+                    operation_id,
+                    'verify_restore',
+                    'FAILED',
+                    {
+                        'target_cluster_id': cluster_id,
+                        'error': error_message
+                    }
+                )
                 
-                # Update metrics with failure
-                self.update_metrics(operation_id, 'verification_failure', 1)
+                # Update metrics
+                self.state_manager.update_metrics(operation_id, 'verify_restore', 'verification_failure', 1)
                 
                 return self.create_response(operation_id, {
                     'message': error_message,
                     'target_cluster_id': cluster_id,
                     'next_step': None
-                }, 500)
+                })
             
             # Verify schema
-            schema_info = self.verify_schema(endpoint, port, master_username, master_password)
+            schema_details = self.verify_schema(endpoint, port, username, password)
             
             # Save state
             state_data = {
                 'target_cluster_id': cluster_id,
-                'cluster_endpoint': endpoint,
-                'cluster_port': port,
-                'verification_status': 'completed',
-                'schema_info': schema_info,
-                'status': 'completed',
-                'success': True
+                'endpoint': endpoint,
+                'port': port,
+                'connection_success': True,
+                'verification_status': 'success',
+                'status': 'success',
+                'success': True,
+                'schema_details': schema_details
             }
             
-            self.save_state(state_data)
+            # Save state using StateManager
+            self.state_manager.save_state(operation_id, 'verify_restore', state_data)
             
-            # Log audit
-            self.log_audit(operation_id, 'SUCCESS', {
-                'target_cluster_id': cluster_id,
-                'schema_count': len(schema_info['schemas']),
-                'table_count': len(schema_info['tables'])
-            })
+            # Log audit event
+            self.state_manager.log_audit_event(
+                operation_id,
+                'verify_restore',
+                'SUCCESS',
+                {
+                    'target_cluster_id': cluster_id,
+                    'schema_count': len(schema_details['schemas']),
+                    'table_count': len(schema_details['tables'])
+                }
+            )
             
             # Update metrics
-            self.update_metrics(operation_id, 'verification_success', 1)
-            self.update_metrics(operation_id, 'schema_count', len(schema_info['schemas']))
-            self.update_metrics(operation_id, 'table_count', len(schema_info['tables']))
+            self.state_manager.update_metrics(operation_id, 'verify_restore', 'verification_success', 1)
             
-            # Trigger next step
-            trigger_next_step(operation_id, 'notify_completion', state_data)
+            # Update state and trigger next step
+            self.state_manager.update_state(operation_id, RestoreState.SETUP_USERS, state_data)
             
             return self.create_response(operation_id, {
-                'message': f"Successfully verified cluster {cluster_id}",
+                'message': f"Cluster {cluster_id} verification successful",
                 'target_cluster_id': cluster_id,
-                'cluster_endpoint': endpoint,
-                'cluster_port': port,
-                'schema_info': schema_info,
-                'next_step': 'notify_completion'
+                'schema_count': len(schema_details['schemas']),
+                'table_count': len(schema_details['tables']),
+                'next_step': 'setup_users'
             })
+            
         except Exception as e:
             return self.handle_error(operation_id, e, {
-                'target_cluster_id': self.config.get('target_cluster_id')
+                'target_cluster_id': self.config_manager.get_all().target_cluster_id if hasattr(self, 'config_manager') else None
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

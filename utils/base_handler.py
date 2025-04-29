@@ -7,15 +7,12 @@ Provides common functionality and error handling for all Lambda functions.
 import time
 import json
 import uuid
-from typing import Dict, Any, TypeVar, Generic
+from typing import Dict, Any, TypeVar, Generic, Optional
+import boto3
 
-from utils.config_manager import ConfigManager
-from utils.common import logger
-from utils.state_utils import (
-    save_state,
-    log_audit_event,
-    update_metrics
-)
+from utils.config_utils import ConfigManager
+from utils.state_utils import StateManager, RestoreState
+from utils.aws_utils import publish_sns_message
 
 T = TypeVar('T')
 
@@ -32,6 +29,7 @@ class BaseHandler(Generic[T]):
         self.step_name = step_name
         self.config_manager = ConfigManager()
         self.config = self.config_manager.get_all()
+        self.state_manager = StateManager(self.config.region)
         self.start_time = time.time()
     
     def validate_event(self, event: Dict[str, Any]) -> None:
@@ -65,38 +63,6 @@ class BaseHandler(Generic[T]):
         
         return f"op-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     
-    def save_initial_state(self, operation_id: str, state_data: Dict[str, Any]) -> None:
-        """
-        Save initial state for the operation.
-        
-        Args:
-            operation_id: Operation ID
-            state_data: State data to save
-        """
-        save_state(operation_id, self.step_name, state_data)
-    
-    def log_audit(self, operation_id: str, status: str, details: Dict[str, Any]) -> None:
-        """
-        Log an audit event.
-        
-        Args:
-            operation_id: Operation ID
-            status: Status of the operation
-            details: Additional details
-        """
-        log_audit_event(operation_id, self.step_name, status, details)
-    
-    def update_metrics(self, operation_id: str, metric_name: str, value: float = 1.0) -> None:
-        """
-        Update metrics for the operation.
-        
-        Args:
-            operation_id: Operation ID
-            metric_name: Name of the metric
-            value: Value of the metric
-        """
-        update_metrics(operation_id, self.step_name, metric_name, value)
-    
     def handle_error(self, operation_id: str, error: Exception, details: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle an error in the operation.
@@ -110,17 +76,32 @@ class BaseHandler(Generic[T]):
             Dict[str, Any]: Error response
         """
         error_message = str(error)
-        logger.error(f"Error in {self.step_name}: {error_message}", extra={
+        print(f"Error in {self.step_name}: {error_message}", extra={
             'operation_id': operation_id,
             'step': self.step_name,
             'error': error_message,
             'details': details
         })
         
-        self.log_audit(operation_id, 'ERROR', {
-            'error': error_message,
-            'details': details
-        })
+        self.state_manager.log_audit_event(
+            operation_id,
+            self.step_name,
+            'ERROR',
+            {'error': error_message, 'details': details}
+        )
+        
+        self.state_manager.update_state(
+            operation_id,
+            RestoreState.FAILED,
+            {'error': error_message}
+        )
+        
+        if self.config.sns_topic_arn:
+            publish_sns_message(
+                self.config.sns_topic_arn,
+                f"Restore operation {operation_id} failed: {error_message}",
+                "Aurora Restore Failed"
+            )
         
         return self.create_response(operation_id, {
             'error': error_message,
@@ -173,6 +154,7 @@ class BaseHandler(Generic[T]):
                 self.config_manager.load_config(event=event)
             
             self.config = self.config_manager.get_all()
+            self.config_manager.validate_config()
             
             # Process the event
             return self.process(event, context)

@@ -1,206 +1,128 @@
 #!/usr/bin/env python3
 """
-AWS service utilities for Aurora restore operations.
-This module provides standardized utilities for AWS service interactions.
+Consolidated AWS utilities for Aurora restore operations.
+Provides common AWS service interactions and helper functions.
 """
 
-import os
-import json
-import time
 import boto3
-from typing import Dict, Any, Optional, List, Union, Tuple
+import json
+from typing import Dict, Any, Optional
 from botocore.exceptions import ClientError
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from utils.core import ENVIRONMENT, AWS_REGION, AWS_ACCOUNT_ID
-
-# Constants for retry mechanism
-MAX_ATTEMPTS = 10
-INITIAL_INTERVAL = 30  # seconds
-
-# Initialize AWS clients with lazy loading
-_clients = {}
-
-def get_client(service_name: str, region_name: Optional[str] = None) -> Any:
+def get_ssm_parameter(name: str, default: str = '') -> str:
     """
-    Get an AWS client with lazy loading.
+    Get parameter from SSM Parameter Store.
     
     Args:
-        service_name: Name of the AWS service
-        region_name: Optional region name
-        
-    Returns:
-        Any: AWS client
-    """
-    key = f"{service_name}:{region_name or AWS_REGION}"
-    
-    if key not in _clients:
-        _clients[key] = boto3.client(service_name, region_name=region_name)
-    
-    return _clients[key]
-
-def get_resource(service_name: str, region_name: Optional[str] = None) -> Any:
-    """
-    Get an AWS resource with lazy loading.
-    
-    Args:
-        service_name: Name of the AWS service
-        region_name: Optional region name
-        
-    Returns:
-        Any: AWS resource
-    """
-    key = f"{service_name}:{region_name or AWS_REGION}"
-    
-    if key not in _clients:
-        _clients[key] = boto3.resource(service_name, region_name=region_name)
-    
-    return _clients[key]
-
-@retry(stop=stop_after_attempt(MAX_ATTEMPTS), wait=wait_exponential(multiplier=1, min=4, max=60))
-def get_ssm_parameter(param_name: str, default: Optional[str] = None) -> str:
-    """
-    Retrieve parameter from SSM Parameter Store.
-    
-    Args:
-        param_name: Name of the parameter
+        name: Parameter name
         default: Default value if parameter not found
         
     Returns:
         str: Parameter value
     """
+    ssm = boto3.client('ssm')
     try:
-        ssm = get_client('ssm')
-        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        response = ssm.get_parameter(Name=name, WithDecryption=True)
         return response['Parameter']['Value']
     except ClientError as e:
-        if e.response['Error']['Code'] == 'ParameterNotFound' and default is not None:
+        if e.response['Error']['Code'] == 'ParameterNotFound':
             return default
         raise
 
-@retry(stop=stop_after_attempt(MAX_ATTEMPTS), wait=wait_exponential(multiplier=1, min=4, max=60))
-def get_secret(secret_name: str) -> Dict[str, Any]:
+def get_rds_client(region: str) -> Any:
     """
-    Retrieve secret from Secrets Manager.
+    Get RDS client for specified region.
     
     Args:
-        secret_name: Name of the secret
+        region: AWS region
         
     Returns:
-        Dict[str, Any]: Secret value
+        boto3.client: RDS client
     """
+    return boto3.client('rds', region_name=region)
+
+def wait_for_cluster_available(cluster_id: str, region: str) -> None:
+    """
+    Wait for cluster to become available.
+    
+    Args:
+        cluster_id: Cluster identifier
+        region: AWS region
+    """
+    rds = get_rds_client(region)
+    waiter = rds.get_waiter('db_cluster_available')
+    waiter.wait(DBClusterIdentifier=cluster_id)
+
+def wait_for_cluster_deleted(cluster_id: str, region: str) -> None:
+    """
+    Wait for cluster to be deleted.
+    
+    Args:
+        cluster_id: Cluster identifier
+        region: AWS region
+    """
+    rds = get_rds_client(region)
+    waiter = rds.get_waiter('db_cluster_deleted')
+    waiter.wait(DBClusterIdentifier=cluster_id)
+
+def get_secret(secret_id: str) -> Dict[str, Any]:
+    """
+    Get secret from Secrets Manager.
+    
+    Args:
+        secret_id: Secret identifier
+        
+    Returns:
+        dict: Secret value
+    """
+    secrets = boto3.client('secretsmanager')
     try:
-        secretsmanager = get_client('secretsmanager')
-        response = secretsmanager.get_secret_value(SecretId=secret_name)
+        response = secrets.get_secret_value(SecretId=secret_id)
         return json.loads(response['SecretString'])
     except ClientError as e:
-        if e.response['Error']['Code'] == 'ResourceNotFoundException':
-            raise ValueError(f"Secret {secret_name} not found")
-        raise
+        raise Exception(f"Failed to get secret {secret_id}: {str(e)}")
 
-@retry(stop=stop_after_attempt(MAX_ATTEMPTS), wait=wait_exponential(multiplier=1, min=4, max=60))
-def send_notification(topic_arn: Optional[str] = None, subject: str = "", message: str = "") -> bool:
+def publish_sns_message(topic_arn: str, message: str, subject: Optional[str] = None) -> None:
     """
-    Send notification to SNS topic.
+    Publish message to SNS topic.
     
     Args:
-        topic_arn: ARN of the SNS topic
-        subject: Subject of the notification
-        message: Message content
-        
-    Returns:
-        bool: True if successful
+        topic_arn: SNS topic ARN
+        message: Message to publish
+        subject: Optional message subject
     """
-    if not topic_arn:
-        return False
-    
+    sns = boto3.client('sns')
     try:
-        sns = get_client('sns')
-        sns.publish(
-            TopicArn=topic_arn,
-            Subject=subject,
-            Message=message
-        )
-        return True
-    except ClientError:
-        return False
+        params = {
+            'TopicArn': topic_arn,
+            'Message': message
+        }
+        if subject:
+            params['Subject'] = subject
+        sns.publish(**params)
+    except ClientError as e:
+        raise Exception(f"Failed to publish SNS message: {str(e)}")
 
-def handle_aws_error(error: ClientError, operation_id: str = "", step: str = "") -> Dict[str, Any]:
+def get_s3_client(region: str) -> Any:
     """
-    Handle AWS API errors in a standardized way.
+    Get S3 client for specified region.
     
     Args:
-        error: The ClientError exception
-        operation_id: Operation ID
-        step: Step name
+        region: AWS region
         
     Returns:
-        Dict[str, Any]: Error information
+        boto3.client: S3 client
     """
-    error_code = error.response['Error']['Code']
-    error_message = error.response['Error']['Message']
-    
-    # Map common error codes to appropriate HTTP status codes
-    status_code_map = {
-        'AccessDeniedException': 403,
-        'InvalidParameterException': 400,
-        'ResourceNotFoundException': 404,
-        'ThrottlingException': 429,
-        'ValidationException': 400
-    }
-    
-    status_code = status_code_map.get(error_code, 500)
-    
-    return {
-        'statusCode': status_code,
-        'error': error_message,
-        'error_type': error_code,
-        'operation_id': operation_id,
-        'step': step
-    }
+    return boto3.client('s3', region_name=region)
 
-@retry(stop=stop_after_attempt(MAX_ATTEMPTS), wait=wait_exponential(multiplier=1, min=4, max=60))
-def trigger_next_step(operation_id: str, next_step: str, event_data: Dict[str, Any] = None, delay_seconds: int = 0) -> bool:
+def get_dynamodb_client(region: str) -> Any:
     """
-    Trigger the next step in the workflow.
+    Get DynamoDB client for specified region.
     
     Args:
-        operation_id: Operation ID
-        next_step: Name of the next step
-        event_data: Data to pass to the next step
-        delay_seconds: Delay in seconds before triggering
+        region: AWS region
         
     Returns:
-        bool: True if successful
+        boto3.client: DynamoDB client
     """
-    try:
-        events = get_client('events')
-        lambda_client = get_client('lambda')
-        
-        # Get the Lambda function name for the next step
-        function_name = f"aurora-restore-{next_step}"
-        
-        # Prepare the event data
-        if event_data is None:
-            event_data = {}
-        
-        event_data['operation_id'] = operation_id
-        
-        # Create the event
-        response = events.put_events(
-            Entries=[
-                {
-                    'Source': 'com.aurora.restore',
-                    'DetailType': next_step,
-                    'Detail': json.dumps(event_data),
-                    'EventBusName': 'default',
-                    'Time': int(time.time() + delay_seconds)
-                }
-            ]
-        )
-        
-        return response['FailedEntryCount'] == 0
-        
-    except Exception as e:
-        logger.error(f"Error triggering next step: {str(e)}", exc_info=True)
-        return False 
+    return boto3.client('dynamodb', region_name=region) 

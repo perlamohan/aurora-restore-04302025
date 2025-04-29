@@ -1,117 +1,115 @@
-# Aurora Restore Pipeline
+# Aurora Restore
 
-This project implements a pipeline for restoring Aurora database clusters from snapshots across AWS regions.
+A serverless application for restoring Aurora databases across regions using AWS Lambda and Step Functions.
 
-## Prerequisites
+## Overview
 
-- AWS CLI installed and configured
-- Python 3.9 or later
-- Required AWS permissions to create and manage:
-  - Lambda functions
-  - DynamoDB tables
-  - SNS topics
-  - IAM roles and policies
-  - Secrets Manager secrets
-  - RDS resources
+This project provides a set of Lambda functions that work together to restore an Aurora database from one region to another. The process involves:
 
-## Deployment Steps
+1. Creating a snapshot of the source database
+2. Copying the snapshot to the target region
+3. Restoring the database from the snapshot
+4. Setting up database users and permissions
+5. Verifying the restore
+6. Cleaning up temporary resources
 
-1. **Update Configuration**
-   - Edit `config.json` with your specific values:
-     - Source and target regions
-     - Cluster IDs
-     - VPC configuration
-     - Database credentials secret IDs
-     - SNS topic ARN
+## Architecture
 
-2. **Create Secrets in AWS Secrets Manager**
-   ```bash
-   # Create master credentials secret
-   aws secretsmanager create-secret \
-       --name aurora-restore-master-credentials \
-       --secret-string '{
-           "username": "master_user",
-           "password": "master_password",
-           "database": "postgres"
-       }'
+The application uses the following AWS services:
 
-   # Create app credentials secret
-   aws secretsmanager create-secret \
-       --name aurora-restore-app-credentials \
-       --secret-string '{
-           "app_username": "app_user",
-           "app_password": "app_password",
-           "readonly_username": "readonly_user",
-           "readonly_password": "readonly_password"
-       }'
-   ```
-
-3. **Run Deployment Script**
-   ```bash
-   chmod +x deploy.sh
-   ./deploy.sh
-   ```
-
-4. **Configure VPC Settings**
-   - Update each Lambda function's VPC configuration in the AWS Console:
-     - Select the VPC
-     - Choose subnets
-     - Select security groups
+- **AWS Lambda**: Executes the restore operations
+- **AWS Step Functions**: Orchestrates the workflow
+- **AWS RDS**: Manages the Aurora databases and snapshots
+- **AWS SNS**: Sends notifications about the restore process
+- **AWS DynamoDB**: Stores state information
+- **AWS SSM Parameter Store**: Stores configuration
 
 ## Lambda Functions
 
-The pipeline consists of the following Lambda functions:
+The application consists of the following Lambda functions:
 
-1. `aurora-restore-snapshot-check`: Checks for available snapshots
-2. `aurora-restore-copy-snapshot`: Copies snapshot to target region
-3. `aurora-restore-check-copy-status`: Monitors copy progress
-4. `aurora-restore-delete-rds`: Deletes existing target cluster
-5. `aurora-restore-restore-snapshot`: Restores cluster from snapshot
-6. `aurora-restore-check-restore-status`: Monitors restore progress
-7. `aurora-restore-setup-db-users`: Sets up database users
-8. `aurora-restore-sns-notification`: Sends completion notification
+1. **aurora-restore-copy-snapshot**: Creates a snapshot of the source database and copies it to the target region
+2. **aurora-restore-check-copy-status**: Checks the status of the snapshot copy
+3. **aurora-restore-restore-snapshot**: Restores the database from the snapshot
+4. **aurora-restore-check-restore-status**: Checks the status of the database restore
+5. **aurora-restore-setup-db-users**: Sets up database users and permissions
+6. **aurora-restore-verify-restore**: Verifies the restored database
+7. **aurora-restore-cleanup**: Cleans up temporary resources
+8. **aurora-restore-notify-completion**: Sends a notification when the restore is complete
 
-## State Management
+## Configuration
 
-- States are stored in DynamoDB table `aurora-restore-state`
-- Each state entry contains:
-  - `operation_id`: Unique identifier for the restore operation
-  - `step`: Current step in the pipeline
-  - Additional step-specific data
+The application uses environment variables for configuration:
+
+### Required Configuration
+
+- `SOURCE_REGION`: The region of the source database
+- `TARGET_REGION`: The region where the database will be restored
+- `SOURCE_CLUSTER_ID`: The identifier of the source database cluster
+- `TARGET_CLUSTER_ID`: The identifier for the target database cluster
+
+### Optional Configuration
+
+- `SNAPSHOT_RETENTION_DAYS`: Number of days to retain snapshots (default: 7)
+- `MAX_WAIT_TIME`: Maximum time to wait for operations to complete in seconds (default: 3600)
+- `WAIT_INTERVAL`: Interval between status checks in seconds (default: 30)
+- `NOTIFICATION_TOPIC_ARN`: ARN of the SNS topic for notifications
+- `STATE_MACHINE_ARN`: ARN of the Step Functions state machine
+
+## Deployment
+
+### Prerequisites
+
+- AWS CLI configured with appropriate permissions
+- Python 3.8 or later
+- Node.js 14 or later (for CDK deployment)
+
+### Manual Deployment
+
+1. Create a Lambda layer with the required dependencies:
+
+```bash
+cd lambda_layers
+./install_dependencies.sh
+```
+
+2. Deploy the Lambda functions and Step Functions state machine using AWS CDK:
+
+```bash
+cdk deploy
+```
+
+## Usage
+
+To start a restore operation, invoke the Step Functions state machine with the following input:
+
+```json
+{
+  "source_cluster_id": "my-source-cluster",
+  "target_cluster_id": "my-target-cluster"
+}
+```
 
 ## Monitoring
 
-- CloudWatch Logs: Each Lambda function logs to its own log group
-- SNS Notifications: Pipeline completion and failures
-- DynamoDB: State tracking and audit trail
+The application logs all operations to CloudWatch Logs. Each log entry includes:
+
+- Operation ID
+- Handler name
+- Timestamp
+- Log level
+- Message
+- Additional context
 
 ## Error Handling
 
-- Each step includes comprehensive error handling
-- Failed operations are logged and reported via SNS
-- State is preserved for debugging and retry scenarios
+The application includes comprehensive error handling:
 
-## Security
+- All operations are idempotent
+- Errors are logged with full context
+- Notifications are sent for all errors
+- The state machine tracks the state of each operation
 
-- Database credentials stored in Secrets Manager
-- IAM roles follow principle of least privilege
-- VPC isolation for Lambda functions
-- Encryption at rest for RDS and DynamoDB
+## License
 
-## Maintenance
-
-- Regular cleanup of old state entries recommended
-- Monitor CloudWatch metrics for performance
-- Review and rotate database credentials periodically
-
-## Troubleshooting
-
-1. Check CloudWatch Logs for detailed error messages
-2. Verify VPC connectivity for Lambda functions
-3. Ensure proper IAM permissions
-4. Validate database credentials in Secrets Manager
-5. Check RDS cluster status and permissions
-
-## Support
-
-For issues and feature requests, please create an issue in the repository. 
+This project is licensed under the MIT License - see the LICENSE file for details. 

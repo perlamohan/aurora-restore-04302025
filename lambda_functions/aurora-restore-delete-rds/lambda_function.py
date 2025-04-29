@@ -8,10 +8,13 @@ import time
 from typing import Dict, Any, Optional, Tuple
 
 from utils.base_handler import BaseHandler
-from utils.common import logger
-from utils.validation import validate_required_params, validate_region, validate_cluster_id
-from utils.aws_utils import get_client, handle_aws_error
-from utils.state_utils import trigger_next_step
+from utils.aws_utils import get_rds_client, wait_for_cluster_available
+from utils.config_utils import ConfigManager, ConfigValidator
+from utils.state_utils import StateManager, RestoreState
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class DeleteRdsHandler(BaseHandler):
     """Handler for deleting RDS clusters."""
@@ -19,6 +22,8 @@ class DeleteRdsHandler(BaseHandler):
     def __init__(self):
         """Initialize the delete RDS handler."""
         super().__init__('delete_rds')
+        self.config_manager = ConfigManager()
+        self.state_manager = StateManager(self.config_manager.get_all().region)
         self.rds_client = None
     
     def validate_config(self) -> None:
@@ -28,20 +33,12 @@ class DeleteRdsHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing or invalid
         """
-        required_params = {
-            'target_region': self.config.get('target_region'),
-            'target_cluster_id': self.config.get('target_cluster_id')
-        }
+        config = self.config_manager.get_all()
         
-        missing_params = validate_required_params(required_params)
-        if missing_params:
-            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
-        
-        if not validate_region(self.config['target_region']):
-            raise ValueError(f"Invalid target region: {self.config['target_region']}")
-        
-        if not validate_cluster_id(self.config['target_cluster_id']):
-            raise ValueError(f"Invalid target cluster ID: {self.config['target_cluster_id']}")
+        # Validate configuration using the ConfigValidator
+        errors = ConfigValidator.validate_function_config(config.__dict__, 'aurora-restore-delete-rds')
+        if errors:
+            raise ValueError(f"Configuration validation errors: {', '.join(errors)}")
     
     def initialize_rds_client(self) -> None:
         """
@@ -50,10 +47,11 @@ class DeleteRdsHandler(BaseHandler):
         Raises:
             ValueError: If target region is not set
         """
-        if not self.config.get('target_region'):
+        config = self.config_manager.get_all()
+        if not config.target_region:
             raise ValueError("Target region is required")
         
-        self.rds_client = get_client('rds', self.config['target_region'])
+        self.rds_client = get_rds_client(config.target_region)
     
     def check_cluster_exists(self, cluster_id: str) -> bool:
         """
@@ -78,7 +76,7 @@ class DeleteRdsHandler(BaseHandler):
             if 'DBClusterNotFoundFault' in str(e):
                 return False
             
-            handle_aws_error(e, f"Error checking if cluster {cluster_id} exists")
+            logger.error(f"Error checking if cluster {cluster_id} exists: {str(e)}")
             raise
     
     def delete_cluster(self, cluster_id: str) -> Dict[str, Any]:
@@ -117,7 +115,7 @@ class DeleteRdsHandler(BaseHandler):
             
             return delete_response['DBCluster']
         except Exception as e:
-            handle_aws_error(e, f"Error deleting cluster {cluster_id}")
+            logger.error(f"Error deleting cluster {cluster_id}: {str(e)}")
             raise
     
     def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -135,6 +133,9 @@ class DeleteRdsHandler(BaseHandler):
             # Get operation ID
             operation_id = self.get_operation_id(event)
             
+            # Load configuration
+            self.config_manager.load_config(event)
+            
             # Validate configuration
             self.validate_config()
             
@@ -142,7 +143,8 @@ class DeleteRdsHandler(BaseHandler):
             self.initialize_rds_client()
             
             # Get cluster ID
-            cluster_id = self.config['target_cluster_id']
+            config = self.config_manager.get_all()
+            cluster_id = config.target_cluster_id
             
             # Check if cluster exists
             cluster_exists = self.check_cluster_exists(cluster_id)
@@ -160,19 +162,25 @@ class DeleteRdsHandler(BaseHandler):
                     'success': True
                 }
                 
-                self.save_state(state_data)
+                # Save state using StateManager
+                self.state_manager.save_state(operation_id, 'delete_rds', state_data)
                 
-                # Log audit
-                self.log_audit(operation_id, 'SUCCESS', {
-                    'target_cluster_id': cluster_id,
-                    'message': 'Cluster does not exist, no need to delete'
-                })
+                # Log audit event
+                self.state_manager.log_audit_event(
+                    operation_id,
+                    'delete_rds',
+                    'SUCCESS',
+                    {
+                        'target_cluster_id': cluster_id,
+                        'message': 'Cluster does not exist, no need to delete'
+                    }
+                )
                 
                 # Update metrics
-                self.update_metrics(operation_id, 'cluster_not_found', 1)
+                self.state_manager.update_metrics(operation_id, 'delete_rds', 'cluster_not_found', 1)
                 
-                # Trigger next step
-                trigger_next_step(operation_id, 'restore_snapshot', state_data)
+                # Update state and trigger next step
+                self.state_manager.update_state(operation_id, RestoreState.RESTORE_SNAPSHOT, state_data)
                 
                 return self.create_response(operation_id, {
                     'message': f"Cluster {cluster_id} does not exist, no need to delete",
@@ -192,19 +200,25 @@ class DeleteRdsHandler(BaseHandler):
                 'success': True
             }
             
-            self.save_state(state_data)
+            # Save state using StateManager
+            self.state_manager.save_state(operation_id, 'delete_rds', state_data)
             
-            # Log audit
-            self.log_audit(operation_id, 'SUCCESS', {
-                'target_cluster_id': cluster_id,
-                'delete_status': delete_response['Status']
-            })
+            # Log audit event
+            self.state_manager.log_audit_event(
+                operation_id,
+                'delete_rds',
+                'SUCCESS',
+                {
+                    'target_cluster_id': cluster_id,
+                    'delete_status': delete_response['Status']
+                }
+            )
             
             # Update metrics
-            self.update_metrics(operation_id, 'cluster_deleted', 1)
+            self.state_manager.update_metrics(operation_id, 'delete_rds', 'cluster_deleted', 1)
             
-            # Trigger next step
-            trigger_next_step(operation_id, 'restore_snapshot', state_data)
+            # Update state and trigger next step
+            self.state_manager.update_state(operation_id, RestoreState.RESTORE_SNAPSHOT, state_data)
             
             return self.create_response(operation_id, {
                 'message': f"Cluster {cluster_id} deletion initiated",
@@ -212,9 +226,10 @@ class DeleteRdsHandler(BaseHandler):
                 'delete_status': delete_response['Status'],
                 'next_step': 'restore_snapshot'
             })
+            
         except Exception as e:
             return self.handle_error(operation_id, e, {
-                'target_cluster_id': self.config.get('target_cluster_id')
+                'target_cluster_id': self.config_manager.get_all().target_cluster_id if hasattr(self, 'config_manager') else None
             })
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

@@ -4,14 +4,18 @@ Lambda function to check if the daily snapshot exists in the source account.
 """
 
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 
 from utils.base_handler import BaseHandler
-from utils.common import logger
-from utils.validation import validate_required_params, validate_region, validate_snapshot_name
-from utils.aws_utils import get_client, handle_aws_error
-from utils.state_utils import trigger_next_step
+from utils.aws_utils import get_rds_client, wait_for_cluster_available, wait_for_cluster_deleted
+from utils.config_utils import ConfigManager, ConfigValidator
+from utils.state_utils import StateManager, RestoreState
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SnapshotCheckHandler(BaseHandler):
     """Handler for checking Aurora snapshots."""
@@ -19,6 +23,8 @@ class SnapshotCheckHandler(BaseHandler):
     def __init__(self):
         """Initialize the snapshot check handler."""
         super().__init__('snapshot_check')
+        self.config_manager = ConfigManager()
+        self.state_manager = StateManager(self.config_manager.get_all().region)
         self.rds_client = None
     
     def validate_config(self) -> None:
@@ -28,17 +34,12 @@ class SnapshotCheckHandler(BaseHandler):
         Raises:
             ValueError: If required parameters are missing or invalid
         """
-        required_params = {
-            'source_region': self.config.get('source_region'),
-            'source_cluster_id': self.config.get('source_cluster_id')
-        }
+        config = self.config_manager.get_all()
         
-        missing_params = validate_required_params(required_params)
-        if missing_params:
-            raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
-        
-        if not validate_region(self.config['source_region']):
-            raise ValueError(f"Invalid source region: {self.config['source_region']}")
+        # Validate configuration using the ConfigValidator
+        errors = ConfigValidator.validate_function_config(config.__dict__, 'aurora-restore-snapshot-check')
+        if errors:
+            raise ValueError(f"Configuration validation errors: {', '.join(errors)}")
     
     def get_target_date(self, event: Dict[str, Any]) -> datetime.date:
         """
@@ -76,14 +77,15 @@ class SnapshotCheckHandler(BaseHandler):
         Returns:
             str: Snapshot name
         """
-        snapshot_prefix = self.config.get('snapshot_prefix', 'aurora-snapshot')
-        cluster_id = self.config.get('source_cluster_id', '')
+        config = self.config_manager.get_all()
+        snapshot_prefix = config.snapshot_prefix
+        cluster_id = config.source_cluster_id
         
         # Format: prefix-cluster-id-YYYY-MM-DD
         snapshot_name = f"{snapshot_prefix}-{cluster_id}-{target_date.strftime('%Y-%m-%d')}"
         
-        # Validate snapshot name
-        if not validate_snapshot_name(snapshot_name):
+        # Validate snapshot name (must be alphanumeric or hyphen, 1-63 characters)
+        if not all(c.isalnum() or c == '-' for c in snapshot_name) or len(snapshot_name) > 63:
             raise ValueError(f"Invalid snapshot name: {snapshot_name}")
         
         return snapshot_name
@@ -95,10 +97,11 @@ class SnapshotCheckHandler(BaseHandler):
         Raises:
             ValueError: If source region is not set
         """
-        if not self.config.get('source_region'):
+        config = self.config_manager.get_all()
+        if not config.source_region:
             raise ValueError("Source region is required")
         
-        self.rds_client = get_client('rds', self.config['source_region'])
+        self.rds_client = get_rds_client(config.source_region)
     
     def check_snapshot(self, snapshot_name: str) -> Tuple[bool, Optional[Dict]]:
         """
@@ -119,7 +122,7 @@ class SnapshotCheckHandler(BaseHandler):
                 return True, response['DBClusterSnapshots'][0]
             return False, None
         except Exception as e:
-            handle_aws_error(e, f"Error checking snapshot {snapshot_name}")
+            logger.error(f"Error checking snapshot {snapshot_name}: {str(e)}")
             return False, None
     
     def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -136,6 +139,9 @@ class SnapshotCheckHandler(BaseHandler):
         try:
             # Get operation ID
             operation_id = self.get_operation_id(event)
+            
+            # Load configuration
+            self.config_manager.load_config(event)
             
             # Validate configuration
             self.validate_config()
@@ -166,25 +172,31 @@ class SnapshotCheckHandler(BaseHandler):
                 state_data['snapshot_status'] = snapshot_details.get('Status')
                 state_data['snapshot_type'] = snapshot_details.get('SnapshotType')
             
-            self.save_initial_state(operation_id, state_data)
+            # Save state using StateManager
+            self.state_manager.save_state(operation_id, 'snapshot_check', state_data)
             
-            # Log audit
-            self.log_audit(operation_id, 'SUCCESS', {
-                'target_date': target_date.strftime('%Y-%m-%d'),
-                'snapshot_name': snapshot_name,
-                'snapshot_exists': snapshot_exists
-            })
+            # Log audit event
+            self.state_manager.log_audit_event(
+                operation_id, 
+                'snapshot_check', 
+                'SUCCESS', 
+                {
+                    'target_date': target_date.strftime('%Y-%m-%d'),
+                    'snapshot_name': snapshot_name,
+                    'snapshot_exists': snapshot_exists
+                }
+            )
             
             # Update metrics
-            self.update_metrics(operation_id, 'snapshot_check', 1)
+            self.state_manager.update_metrics(operation_id, 'snapshot_check', 'snapshot_check', 1)
             if snapshot_exists:
-                self.update_metrics(operation_id, 'snapshot_found', 1)
+                self.state_manager.update_metrics(operation_id, 'snapshot_check', 'snapshot_found', 1)
             else:
-                self.update_metrics(operation_id, 'snapshot_not_found', 1)
+                self.state_manager.update_metrics(operation_id, 'snapshot_check', 'snapshot_not_found', 1)
             
-            # Trigger next step if snapshot exists
+            # Update state and trigger next step if snapshot exists
             if snapshot_exists:
-                trigger_next_step(operation_id, 'copy_snapshot', state_data)
+                self.state_manager.update_state(operation_id, RestoreState.COPY_SNAPSHOT, state_data)
                 return self.create_response(operation_id, {
                     'message': f"Snapshot {snapshot_name} exists, triggering copy",
                     'snapshot_name': snapshot_name,

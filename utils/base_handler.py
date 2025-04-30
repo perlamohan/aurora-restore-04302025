@@ -7,12 +7,16 @@ Provides common functionality and error handling for all Lambda functions.
 import time
 import json
 import uuid
+import logging
 from typing import Dict, Any, TypeVar, Generic, Optional
 import boto3
 
 from utils.config_utils import ConfigManager
 from utils.state_utils import StateManager, RestoreState
 from utils.aws_utils import publish_sns_message
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
@@ -76,7 +80,7 @@ class BaseHandler(Generic[T]):
             Dict[str, Any]: Error response
         """
         error_message = str(error)
-        print(f"Error in {self.step_name}: {error_message}", extra={
+        logger.error(f"Error in {self.step_name}: {error_message}", extra={
             'operation_id': operation_id,
             'step': self.step_name,
             'error': error_message,
@@ -99,18 +103,27 @@ class BaseHandler(Generic[T]):
         if self.config.sns_topic_arn:
             publish_sns_message(
                 self.config.sns_topic_arn,
-                f"Restore operation {operation_id} failed: {error_message}",
-                "Aurora Restore Failed"
+                f"Error in {self.step_name}: {error_message}",
+                {
+                    'operation_id': operation_id,
+                    'step': self.step_name,
+                    'error': error_message,
+                    'details': details
+                }
             )
         
-        return self.create_response(operation_id, {
-            'error': error_message,
-            'details': details
-        }, 500)
+        return self.create_response(
+            operation_id,
+            {
+                'error': error_message,
+                'details': details
+            },
+            500
+        )
     
     def create_response(self, operation_id: str, data: Dict[str, Any], status_code: int = 200) -> Dict[str, Any]:
         """
-        Create a response for the Lambda function.
+        Create a standardized response.
         
         Args:
             operation_id: Operation ID
@@ -118,13 +131,14 @@ class BaseHandler(Generic[T]):
             status_code: HTTP status code
             
         Returns:
-            Dict[str, Any]: Lambda response
+            Dict[str, Any]: Standardized response
         """
         return {
             'statusCode': status_code,
             'body': json.dumps({
                 'operation_id': operation_id,
                 'step': self.step_name,
+                'timestamp': int(time.time()),
                 'data': data
             })
         }
@@ -165,16 +179,13 @@ class BaseHandler(Generic[T]):
     
     def process(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         """
-        Process the Lambda event.
+        Process the event.
         
         Args:
             event: Lambda event
             context: Lambda context
             
         Returns:
-            Dict[str, Any]: Lambda response
-            
-        Raises:
-            NotImplementedError: This method must be implemented by subclasses
+            Dict[str, Any]: Response
         """
-        raise NotImplementedError("Subclasses must implement process method") 
+        raise NotImplementedError("Subclasses must implement process()") 

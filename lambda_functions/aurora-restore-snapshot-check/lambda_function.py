@@ -125,8 +125,8 @@ class SnapshotCheckHandler(BaseHandler):
         operation_id = self.get_operation_id(event)
         
         try:
-            # Load and validate configuration
-            self.config_manager.load_config(event)
+            # Configuration is already loaded in BaseHandler.execute()
+            # Just validate it
             self.validate_config()
             
             # Get target date

@@ -16,7 +16,6 @@ This document provides step-by-step instructions for deploying and testing the `
 - Python 3.9 installed
 - Required Python packages:
   - boto3
-  - jsonschema
 
 ## Setting Up Infrastructure
 
@@ -141,7 +140,7 @@ mkdir -p lambda-layers/dependencies/python
 cd lambda-layers/dependencies/python
 
 # Install required packages
-pip install boto3 jsonschema -t .
+pip install boto3 -t .
 
 # Create the layer zip
 cd ..
@@ -318,6 +317,7 @@ aws logs get-log-events \
 - **Invalid SSM Parameters**: Verify SSM parameter values are correct
 - **Layer Issues**: Check layer versions and compatibility
 - **DynamoDB Errors**: Verify table names and permissions
+- **Configuration Validation**: Check that all required fields are present in the configuration
 
 3. **Cleanup**
 

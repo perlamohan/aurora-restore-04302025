@@ -11,7 +11,6 @@ import logging
 import sys
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass
-from jsonschema import validate, ValidationError
 
 from utils.aws_utils import get_ssm_parameter
 
@@ -21,50 +20,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# Configuration schema
-CONFIG_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "source_region": {"type": "string"},
-        "target_region": {"type": "string"},
-        "source_cluster_id": {"type": "string"},
-        "target_cluster_id": {"type": "string"},
-        "snapshot_prefix": {"type": "string"},
-        "vpc_security_group_ids": {"type": "string"},
-        "db_subnet_group_name": {"type": "string"},
-        "kms_key_id": {"type": "string"},
-        "master_credentials_secret_id": {"type": "string"},
-        "app_credentials_secret_id": {"type": "string"},
-        "copy_status_retry_delay": {"type": "integer", "minimum": 1},
-        "restore_status_retry_delay": {"type": "integer", "minimum": 1},
-        "delete_status_retry_delay": {"type": "integer", "minimum": 1},
-        "max_copy_attempts": {"type": "integer", "minimum": 1},
-        "copy_check_interval": {"type": "integer", "minimum": 1},
-        "max_restore_attempts": {"type": "integer", "minimum": 1},
-        "restore_check_interval": {"type": "integer", "minimum": 1},
-        "skip_final_snapshot": {"type": "boolean"},
-        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-        "deletion_protection": {"type": "boolean"},
-        "db_connection_timeout": {"type": "integer", "minimum": 1},
-        "archive_snapshot": {"type": "boolean"},
-        "environment": {"type": "string", "enum": ["dev", "test", "prod"]},
-        "region": {"type": "string"},
-        "account_id": {"type": "string"},
-        "state_table_name": {"type": "string"},
-        "audit_table_name": {"type": "string"},
-        "log_level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR"]},
-        "sns_topic_arn": {"type": "string"}
-    },
-    "required": [
-        "source_region",
-        "target_region",
-        "source_cluster_id",
-        "target_cluster_id",
-        "state_table_name",
-        "audit_table_name"
-    ]
-}
 
 # Function-specific required fields
 FUNCTION_REQUIRED_FIELDS = {
@@ -249,108 +204,99 @@ class ConfigManager:
         except Exception as e:
             logger.warning(f"Failed to load SSM config: {str(e)}")
         
-        # Override with event data if provided
-        if event and isinstance(event, dict):
-            if 'config' in event:
-                config.update(event['config'])
-            if 'body' in event and isinstance(event['body'], dict) and 'config' in event['body']:
-                config.update(event['body']['config'])
+        # Update from event if provided
+        if event:
+            config.update(event)
         
-        # Override with state data if provided
-        if state and isinstance(state, dict) and 'config' in state:
-            config.update(state['config'])
+        # Update from state if provided
+        if state:
+            config.update(state)
         
-        # Create Config object
-        self.config = Config(**config)
+        self.config = config
     
     def get_all(self) -> Config:
         """
-        Get the current configuration.
+        Get all configuration values.
         
         Returns:
             Config: Configuration object
         """
-        if self.config is None:
+        if not self.config:
             self.load_config()
-        return self.config
+        return Config(**self.config)
     
     def validate_config(self) -> None:
         """
-        Validate the current configuration.
+        Validate configuration.
         
         Raises:
             ValueError: If configuration is invalid
         """
-        if self.config is None:
-            raise ValueError("Configuration not loaded")
+        if not self.config:
+            self.load_config()
         
+        # Check required fields for all functions
         required_fields = [
-            'source_region',
-            'target_region',
-            'source_cluster_id',
-            'target_cluster_id',
-            'vpc_security_group_ids',
-            'db_subnet_group_name',
-            'master_credentials_secret_id',
-            'app_credentials_secret_id'
+            "source_region",
+            "target_region",
+            "source_cluster_id",
+            "target_cluster_id",
+            "state_table_name",
+            "audit_table_name"
         ]
         
-        for field in required_fields:
-            if not getattr(self.config, field):
-                raise ValueError(f"Missing required configuration: {field}")
-        
-        if self.config.source_region == self.config.target_region:
-            raise ValueError("Source and target regions must be different")
-        
-        if self.config.source_cluster_id == self.config.target_cluster_id:
-            raise ValueError("Source and target cluster IDs must be different")
+        missing_fields = [field for field in required_fields if not self.config.get(field)]
+        if missing_fields:
+            raise ValueError(f"Missing required configuration fields: {', '.join(missing_fields)}")
 
 class ConfigValidator:
-    """
-    Validator for configuration values.
-    
-    This class validates configuration values against a JSON Schema and
-    ensures that all required fields for a specific function are present.
-    """
+    """Configuration validator."""
     
     @staticmethod
     def validate_config(config: Dict[str, Any]) -> List[str]:
         """
-        Validate configuration against the schema.
+        Validate configuration.
         
         Args:
             config: Configuration dictionary
             
         Returns:
-            List of validation errors, empty if valid
+            List[str]: List of validation errors
         """
         errors = []
-        try:
-            validate(instance=config, schema=CONFIG_SCHEMA)
-        except ValidationError as e:
-            errors.append(f"Schema validation error: {str(e)}")
+        required_fields = [
+            "source_region",
+            "target_region",
+            "source_cluster_id",
+            "target_cluster_id",
+            "state_table_name",
+            "audit_table_name"
+        ]
+        
+        for field in required_fields:
+            if not config.get(field):
+                errors.append(f"Missing required field: {field}")
         
         return errors
     
     @staticmethod
     def validate_function_config(config: Dict[str, Any], function_name: str) -> List[str]:
         """
-        Validate configuration for a specific function.
+        Validate function-specific configuration.
         
         Args:
             config: Configuration dictionary
-            function_name: Name of the Lambda function
+            function_name: Function name
             
         Returns:
-            List of validation errors, empty if valid
+            List[str]: List of validation errors
         """
-        errors = ConfigValidator.validate_config(config)
+        errors = []
+        required_fields = FUNCTION_REQUIRED_FIELDS.get(function_name, [])
         
-        # Check for function-specific required fields
-        if function_name in FUNCTION_REQUIRED_FIELDS:
-            for field in FUNCTION_REQUIRED_FIELDS[function_name]:
-                if field not in config or not config[field]:
-                    errors.append(f"Missing required field for {function_name}: {field}")
+        for field in required_fields:
+            if not config.get(field):
+                errors.append(f"Missing required field for {function_name}: {field}")
         
         return errors
     
@@ -361,19 +307,19 @@ class ConfigValidator:
         
         Args:
             config: Configuration dictionary
-            function_name: Name of the Lambda function
+            function_name: Function name
             
         Returns:
-            True if valid, False otherwise
+            bool: True if validation passes, False otherwise
         """
-        errors = ConfigValidator.validate_function_config(config, function_name)
+        errors = ConfigValidator.validate_config(config)
+        errors.extend(ConfigValidator.validate_function_config(config, function_name))
         
         if errors:
             for error in errors:
-                logger.error(f"Configuration validation error for {function_name}: {error}")
+                logger.error(error)
             return False
         
-        logger.info(f"Configuration validation successful for {function_name}")
         return True
 
 class ConfigTemplateGenerator:
